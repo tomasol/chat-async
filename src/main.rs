@@ -1,9 +1,12 @@
+#![type_length_limit = "1556548"]
+
 extern crate async_std;
 extern crate futures;
 #[macro_use]
 extern crate log;
 
 use std::time::Duration;
+use async_std::task::{sleep, spawn};
 use async_std::future;
 use async_std::future::TimeoutError;
 use async_std::task;
@@ -11,11 +14,13 @@ use env_logger::Builder;
 use futures::future::join_all;
 use std::io::Write;
 use log::LevelFilter;
-use std::thread;
 use futures::future::TryFutureExt;
-use futures::Future;
+use futures::stream::TryStreamExt;
+use futures::{Future, AsyncReadExt};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use pin_project_lite::pin_project;
+
 
 fn init_logging() {
     let mut builder = Builder::from_default_env();
@@ -28,33 +33,10 @@ fn init_logging() {
         writeln!(buf, "{} {} {:?} {} - {}",
                  buf.timestamp_millis(),
                  file,
-                 thread::current().id(), record.level(), record.args())
+                 std::thread::current().id(), record.level(), record.args())
     });
     builder.format_timestamp_micros();
     builder.init();
-}
-
-struct SleepPrint<Fut> {
-    sleep: Fut,
-}
-
-impl<Fut: Future<Output=()>> Future for SleepPrint<Fut> {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let sleep: Pin<&mut Fut> = unsafe { self.map_unchecked_mut(|s| &mut s.sleep) };
-        sleep.poll(cx)
-    }
-}
-
-struct DoNothing;
-
-impl Future for DoNothing {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Self::Output> {
-        Poll::Ready(())
-    }
 }
 
 fn sleepus() -> impl std::future::Future<Output=()> {
@@ -75,6 +57,60 @@ async fn interruptus() {
         task::sleep(Duration::from_millis(1000)).await;
         info!("Interruptus {} finished", i);
     }
+}
+
+pin_project! {
+    struct TwoFutures<Fut1, Fut2> {
+        first_done: bool,
+        #[pin]
+        first: Fut1,
+        #[pin]
+        second: Fut2,
+    }
+}
+
+impl<Fut1: Future, Fut2: Future> Future for TwoFutures<Fut1, Fut2> {
+    type Output = Fut2::Output;
+
+    fn poll(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Self::Output> {
+        let this = self.project();
+        if !*this.first_done {
+            // keep polling first until it is ready
+            if let Poll::Ready(_) = this.first.poll(ctx) {
+                *this.first_done = true;
+            }
+        }
+        if *this.first_done {
+            this.second.poll(ctx)
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+fn sleepus2() -> impl Future<Output=()> {
+    TwoFutures {
+        first_done: false,
+        first: task::sleep(Duration::from_millis(3000)),
+        second: async { println!("Hello TwoFutures"); },
+    }
+}
+
+fn sleepus3() -> impl Future<Output=(std::result::Result<i32, i32>)> {
+//async fn sleepus3() -> Result<i32, i32> {
+    let future = async {
+        info!("start");
+        Ok::<i32, i32>(1)
+    };
+    let future = future.and_then(|x| async move { Ok::<i32, i32>(x + 3) });
+
+
+    let future = future.and_then(|x| async move {
+        info!("Got {}", x);
+        task::sleep(Duration::from_secs(1)).await;
+        Ok::<i32, i32>(-1)
+    });
+    future
 }
 
 async fn vector_timeout_cancel() {
@@ -108,16 +144,13 @@ async fn vector_timeout_cancel() {
     info!("sum is {}", sum);
 }
 
-async fn wait_for_interruptus() {
-    init_logging();
-    let sleepus = task::spawn(sleepus());
-    interruptus().await;
-    info!("wait_for_interruptus finishes");
-}
-
 #[async_std::main]
 async fn main() -> Result<(), TimeoutError> {
-    wait_for_interruptus().await;
-    task::sleep(Duration::from_millis(1000)).await;
+    init_logging();
+
+    let result: Result<i32, i32> = sleepus3().await;
+    info!("Finished {:?}", result);
+
+//    task::sleep(Duration::from_secs(5)).await;
     Ok(())
 }
