@@ -1,5 +1,3 @@
-#![type_length_limit = "1556548"]
-
 extern crate async_std;
 extern crate futures;
 #[macro_use]
@@ -131,13 +129,15 @@ async fn connection_loop(
         }
     }
     debug!("Reader {} is exitting", name);
+    // TODO: send event also on error
+    broker.send(Event::DisconnectedPeer {name}).await?;
     Ok(())
 }
 
 // broker
 
 #[derive(Debug)]
-enum Void {} // 1
+enum Void {}
 
 #[derive(Debug)]
 enum Event {
@@ -154,12 +154,14 @@ enum Event {
     ListAllUsers {
         from: String,
     },
+    DisconnectedPeer {
+        name: String
+    },
 }
 
 async fn broker_loop(mut events: Receiver<Event>) -> Result<()> {
     let mut peers: HashMap<String, Sender<String>> = HashMap::new();
     let mut writers = Vec::new();
-//    let mut shutdowns = FuturesUnordered::<Option<Void>>::new();
 
     let mut events = events.fuse();
     loop {
@@ -173,7 +175,7 @@ async fn broker_loop(mut events: Receiver<Event>) -> Result<()> {
         }
     }
 
-//    while let Some(event) = events.next().await { // TODO: listen on all shutdown channels, purge
+//    while let Some(event) = events.next().await {
 //        matchEvent(event, &mut peers, &mut writers).await;
 //    }
     info!("Dropping peers");
@@ -187,8 +189,8 @@ async fn broker_loop(mut events: Receiver<Event>) -> Result<()> {
 
 async fn matchEvent(
     event: Event,
-    peers: & mut HashMap<String, Sender<String>>,
-    writers: & mut Vec<task::JoinHandle<()>>,
+    peers: &mut HashMap<String, Sender<String>>,
+    writers: &mut Vec<task::JoinHandle<()>>,
 ) -> Result<()> {
     match event {
         Event::NewPeer { name, stream, shutdown } => {
@@ -235,6 +237,10 @@ async fn matchEvent(
             } else {
                 warn!("Sender '{}' not found, dropping message", from);
             }
+        }
+        Event::DisconnectedPeer { name } => {
+            debug!("Removing {}", name);
+            peers.remove(&name);
         }
     }
     Ok(())
