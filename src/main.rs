@@ -89,7 +89,7 @@ async fn accept_loop(addr: impl ToSocketAddrs) -> Result<()> {
 }
 
 // reader
-async fn connection_loop(
+async fn reader_loop(
     id: String,
     mut broker: Sender<Event>,
     stream: Arc<TcpStream>,
@@ -131,7 +131,7 @@ async fn connection_loop(
         }
     }
     debug!("Reader {} is exitting", id);
-    // TODO: send event also on error
+    // TODO: send event also on error, drop event, broker should listen on shutdown_receiver close
     broker.send(Event::DisconnectedPeer { id }).await?;
     // dropping shutdown_sender should kill writer actor
     Ok(())
@@ -214,16 +214,15 @@ async fn match_event(
                     // start reader that can send events to broker
                     let (shutdown_sender, shutdown_receiver) = mpsc::unbounded();
                     spawn_and_log_error(
-                        format!("reader:{}", id),
-                        connection_loop(id.clone(), broker_sender, stream.clone(), shutdown_sender));
+                        format!("reader: '{}'", id),
+                        reader_loop(id.clone(), broker_sender, stream.clone(), shutdown_sender));
                     // start writer that receives messages from broker
                     let (writer_sender, writer_receiver) = mpsc::unbounded();
                     entry.insert(("unknown".to_string(), writer_sender));
-                    error!("inserted peers[{}]", id);
 
-                    let writer_actor =
-                        connection_writer_loop(id.clone(), writer_receiver, stream, shutdown_receiver);
-                    let handle = spawn_and_log_error(id, writer_actor);
+                    let handle = spawn_and_log_error(
+                        format!("writer: '{}'", id),
+                        writer_loop(id.clone(), writer_receiver, stream, shutdown_receiver));
                     writers.push(handle);
                 }
             }
@@ -236,10 +235,10 @@ async fn match_event(
                 ids_to_writer_entries.insert(id, (name, writer));
             }
         }
-        Event::Message { id, to_names: toNames, msg } => {
-            for receiverName in toNames {
+        Event::Message { id, to_names, msg } => {
+            for receiver_name in to_names {
                 let mut sent_to_channel: bool = false;
-                if let Some(receiver_id) = names_to_ids.get(receiverName.as_str()) {
+                if let Some(receiver_id) = names_to_ids.get(receiver_name.as_str()) {
                     if let Some((sender_name, receiver_channel)) =
                     ids_to_writer_entries.get_mut(receiver_id.as_str()) {
                         let msg = format!("Got message from '{}': {}", sender_name, msg);
@@ -255,7 +254,7 @@ async fn match_event(
                 if !sent_to_channel {
                     // send not found to sender of this message, send back warning
                     if let Some((_, sender_channel)) = ids_to_writer_entries.get_mut(id.as_str()) {
-                        let msg = format!("not found: {}", receiverName);
+                        let msg = format!("not found: {}", receiver_name);
                         sender_channel.send(msg).await?
                     } else {
                         warn!("Sender id:'{}' not found, dropping message", id);
@@ -284,7 +283,7 @@ async fn match_event(
 }
 
 // writer
-async fn connection_writer_loop(
+async fn writer_loop(
     name: String,
     messages: Receiver<String>,
     stream: Arc<TcpStream>,
