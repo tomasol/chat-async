@@ -61,8 +61,8 @@ fn init_logging() {
 }
 
 fn spawn_and_log_error<F>(id: String, fut: F) -> task::JoinHandle<()>
-    where
-        F: Future<Output=Result<()>> + Send + 'static,
+where
+    F: Future<Output = Result<()>> + Send + 'static,
 {
     task::spawn(async move {
         if let Err(e) = fut.await {
@@ -274,7 +274,7 @@ async fn match_event(
                 let mut sent_to_channel: bool = false;
                 if let Some(receiver_id) = names_to_ids.get(receiver_name.as_str()) {
                     if let Some((sender_name, receiver_channel)) =
-                    ids_to_writer_entries.get_mut(receiver_id.as_str())
+                        ids_to_writer_entries.get_mut(receiver_id.as_str())
                     {
                         let msg = format!("Got message from '{}': {}", sender_name, msg);
                         // TODO spawn instead?
@@ -358,4 +358,36 @@ async fn main() -> Result<()> {
     init_logging();
     let fut = accept_loop("127.0.0.1:8080");
     task::block_on(fut)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn receive_test(mut msg_receiver: Receiver<String>) -> bool {
+        select! {
+            msg = msg_receiver.next().fuse() => match msg {
+                Some(msg) => {
+                    assert!(msg == "test");
+                    eprintln!("Got test!");
+                    true
+                }
+                _ => false
+
+            }
+        }
+    }
+
+    async fn select_queue() -> Result<()> {
+        let (mut msg_sender, msg_receiver) = mpsc::unbounded();
+        let spawned = task::spawn(receive_test(msg_receiver));
+        msg_sender.send("test".to_string()).await?;
+        assert!(spawned.await);
+        Ok(())
+    }
+
+    #[test]
+    fn basic_queue() {
+        task::block_on(select_queue());
+    }
 }
