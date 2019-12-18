@@ -69,14 +69,18 @@ fn spawn_and_log_error<F>(id: String, fut: F) -> task::JoinHandle<()>
 
 async fn accept_loop(addr: impl ToSocketAddrs) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
-    let (broker_sender, broker_receiver) = mpsc::unbounded();
+    let (mut broker_sender, broker_receiver) = mpsc::unbounded();
     let broker_handle = task::spawn(broker_loop(broker_receiver));
     let mut incoming = listener.incoming();
     while let Some(stream) = incoming.next().await { // TODO: how to shutdown this?
         let stream = stream?;
+        let stream = Arc::new(stream);
         let id = stream.peer_addr()?;
-        info!("Accepting from: {}", id);
-        spawn_and_log_error(format!("reader:{}", id), connection_loop(broker_sender.clone(), stream));
+        broker_sender.send(Event::NewClient {
+            id: id.to_string(),
+            stream,
+            broker_sender: broker_sender.clone(),
+        }).await?;
     }
     info!("Dropping broker");
     drop(broker_sender);
@@ -86,24 +90,22 @@ async fn accept_loop(addr: impl ToSocketAddrs) -> Result<()> {
 
 // reader
 async fn connection_loop(
+    id: String,
     mut broker: Sender<Event>,
-    stream: TcpStream,
+    stream: Arc<TcpStream>,
+    _shutdown_sender: Sender<Void>,
 ) -> Result<()> {
-    let stream = Arc::new(stream);
     let reader = BufReader::new(&*stream);
     let mut lines = reader.lines();
-
     let name = match lines.next().await {
         None => Err("peer disconnected immediately")?,
         Some(line) => line?,
     };
     debug!("name = {}", name);
-    // dropping this should kill writer actor
-    let (_shutdown_sender, shutdown_receiver) = mpsc::unbounded::<Void>();
+
     broker.send(Event::NewPeer {
+        id: id.clone(),
         name: name.clone(),
-        stream: Arc::clone(&stream),
-        shutdown: shutdown_receiver,
     }).await?;
 
     while let Some(line) = lines.next().await {
@@ -115,22 +117,23 @@ async fn connection_loop(
             let dest: Vec<String> = dest.split(',').map(|name| name.trim().to_string()).collect();
             let msg: String = msg.to_string();
             broker.send(Event::Message {
-                from: name.clone(),
-                to: dest,
+                id: id.clone(),
+                to_names: dest,
                 msg,
             }).await.unwrap(); // awaiting on what? broker or receivers?
         } else if line == "/w" {
             broker.send(Event::ListAllUsers {
-                from: name.clone(),
+                id: id.clone(),
             }).await.unwrap();
         } else if line == "/q" {
             debug!("Client {} requested quit", name);
             break;
         }
     }
-    debug!("Reader {} is exitting", name);
+    debug!("Reader {} is exitting", id);
     // TODO: send event also on error
-    broker.send(Event::DisconnectedPeer {name}).await?;
+    broker.send(Event::DisconnectedPeer { id }).await?;
+    // dropping shutdown_sender should kill writer actor
     Ok(())
 }
 
@@ -141,26 +144,33 @@ enum Void {}
 
 #[derive(Debug)]
 enum Event {
-    NewPeer {
-        name: String,
+    NewClient {
+        id: String,
         stream: Arc<TcpStream>,
-        shutdown: Receiver<Void>,
+        broker_sender: Sender<Event>,
+    },
+    NewPeer {
+        id: String,
+        name: String,
     },
     Message {
-        from: String,
-        to: Vec<String>,
+        id: String,
+        to_names: Vec<String>,
         msg: String,
     },
     ListAllUsers {
-        from: String,
+        id: String,
     },
     DisconnectedPeer {
-        name: String
+        id: String
     },
 }
 
-async fn broker_loop(mut events: Receiver<Event>) -> Result<()> {
-    let mut peers: HashMap<String, Sender<String>> = HashMap::new();
+type WriterEntry = (String, Sender<String>);
+
+async fn broker_loop(events: Receiver<Event>) -> Result<()> {
+    let mut ids_to_writer_entries: HashMap<String, WriterEntry> = HashMap::new();
+    let mut names_to_ids: HashMap<String, String> = HashMap::new();
     let mut writers = Vec::new();
 
     let mut events = events.fuse();
@@ -168,7 +178,8 @@ async fn broker_loop(mut events: Receiver<Event>) -> Result<()> {
         select! {
             event =  events.next() => match event {
                 Some(event) => {
-                    matchEvent(event, &mut peers, &mut writers).await?
+                    match_event(event, &mut ids_to_writer_entries,
+                     &mut names_to_ids, &mut writers).await?
                     }
                 None => break,
             }
@@ -179,7 +190,7 @@ async fn broker_loop(mut events: Receiver<Event>) -> Result<()> {
 //        matchEvent(event, &mut peers, &mut writers).await;
 //    }
     info!("Dropping peers");
-    drop(peers);
+    drop(ids_to_writer_entries);
     // all task spawned by this should be waited for
     for writer in writers {
         writer.await;
@@ -187,70 +198,95 @@ async fn broker_loop(mut events: Receiver<Event>) -> Result<()> {
     Ok(())
 }
 
-async fn matchEvent(
+async fn match_event(
     event: Event,
-    peers: &mut HashMap<String, Sender<String>>,
+    ids_to_writer_entries: &mut HashMap<String, WriterEntry>,
+    names_to_ids: &mut HashMap<String, String>,
     writers: &mut Vec<task::JoinHandle<()>>,
 ) -> Result<()> {
+    debug!("{:?}", event);
     match event {
-        Event::NewPeer { name, stream, shutdown } => {
-            let id = format!("writer:{}", name);
-            match peers.entry(name) {
-                Entry::Occupied(..) => (), // TODO: update to new stream
+        Event::NewClient { id, stream, broker_sender } => {
+            info!("Accepting from: {}", id);
+            match ids_to_writer_entries.entry(id.clone()) {
+                Entry::Occupied(..) => (), // TODO
                 Entry::Vacant(entry) => {
-                    let (client_sender, client_receiver) = mpsc::unbounded();
-                    entry.insert(client_sender);
+                    // start reader that can send events to broker
+                    let (shutdown_sender, shutdown_receiver) = mpsc::unbounded();
+                    spawn_and_log_error(
+                        format!("reader:{}", id),
+                        connection_loop(id.clone(), broker_sender, stream.clone(), shutdown_sender));
+                    // start writer that receives messages from broker
+                    let (writer_sender, writer_receiver) = mpsc::unbounded();
+                    entry.insert(("unknown".to_string(), writer_sender));
+                    error!("inserted peers[{}]", id);
+
                     let writer_actor =
-                        connection_writer_loop(id.clone(), client_receiver, stream, shutdown);
+                        connection_writer_loop(id.clone(), writer_receiver, stream, shutdown_receiver);
                     let handle = spawn_and_log_error(id, writer_actor);
                     writers.push(handle);
                 }
             }
         }
-        Event::Message { from, to, msg } => {
-            for receiver in to {
-                let mut sentToChannel: bool = false;
-                if let Some(receiverChannel) = peers.get_mut(&receiver) {
-                    let msg = format!("from {}: {}", from, msg);
-                    // TODO spawn instead?
-                    sentToChannel = match receiverChannel.send(msg).await {
-                        Ok(_) => { true }
-                        Err(_) => false,
-                    }
-                }
-                if !sentToChannel {
-                    // send not found to sender of this message
-                    if let Some(senderChannel) = peers.get_mut(&from) {
-                        let msg = format!("not found: {}", receiver);
-                        senderChannel.send(msg).await?
+        Event::NewPeer { id, name } => {
+            info!("Id: '{}' name: '{}'", id, name);
+            names_to_ids.insert(name.clone(), id.clone());
+            if let Some((old_name, writer)) = ids_to_writer_entries.remove(&id) {
+                debug!("Id: '{}' updating old name '{}' to '{}'", id, old_name, name);
+                ids_to_writer_entries.insert(id, (name, writer));
+            }
+        }
+        Event::Message { id, to_names: toNames, msg } => {
+            for receiverName in toNames {
+                let mut sent_to_channel: bool = false;
+                if let Some(receiver_id) = names_to_ids.get(receiverName.as_str()) {
+                    if let Some((sender_name, receiver_channel)) =
+                    ids_to_writer_entries.get_mut(receiver_id.as_str()) {
+                        let msg = format!("Got message from '{}': {}", sender_name, msg);
+                        // TODO spawn instead?
+                        sent_to_channel = match receiver_channel.send(msg).await {
+                            Ok(_) => { true }
+                            Err(_) => false,
+                        }
                     } else {
-                        warn!("Sender '{}' not found, dropping message", from);
+                        error!("Cannot find name of sender with id:'{}'", id);
+                    }
+                }
+                if !sent_to_channel {
+                    // send not found to sender of this message, send back warning
+                    if let Some((_, sender_channel)) = ids_to_writer_entries.get_mut(id.as_str()) {
+                        let msg = format!("not found: {}", receiverName);
+                        sender_channel.send(msg).await?
+                    } else {
+                        warn!("Sender id:'{}' not found, dropping message", id);
                     }
                 }
             }
         }
-        Event::ListAllUsers { from } => {
-            let allUsers: String = peers.keys().into_iter()
+        Event::ListAllUsers { id } => {
+            let all_users: String = names_to_ids.keys().into_iter()
                 .map(|x| x.as_str()).collect::<Vec<&str>>().join(",");
-            if let Some(senderChannel) = peers.get_mut(&from) {
-                senderChannel.send(allUsers).await?
+            debug!("All users: {}", all_users);
+            if let Some((_, writer_sender)) = ids_to_writer_entries.get_mut(id.as_str()) {
+                writer_sender.send(all_users).await?
             } else {
-                warn!("Sender '{}' not found, dropping message", from);
+                warn!("Cannot find writer for id:'{}', dropping message", id);
             }
         }
-        Event::DisconnectedPeer { name } => {
-            debug!("Removing {}", name);
-            peers.remove(&name);
+        Event::DisconnectedPeer { id } => {
+            debug!("Removing id:'{}'", id);
+            if let Some((name, _)) = ids_to_writer_entries.remove(&id) {
+                names_to_ids.remove(&name);
+            }
         }
     }
     Ok(())
 }
 
-
 // writer
 async fn connection_writer_loop(
     name: String,
-    mut messages: Receiver<String>,
+    messages: Receiver<String>,
     stream: Arc<TcpStream>,
     shutdown: Receiver<Void>,
 ) -> Result<()> {
@@ -283,10 +319,5 @@ async fn connection_writer_loop(
 async fn main() -> Result<()> {
     init_logging();
     let fut = accept_loop("127.0.0.1:8080");
-    task::block_on(fut);
-//    let result: Result<i32, i32> = sleepus3().await;
-    info!("Finished");
-
-//    task::sleep(Duration::from_secs(5)).await;
-    Ok(())
+    task::block_on(fut)
 }
