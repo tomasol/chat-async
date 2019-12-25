@@ -38,7 +38,7 @@ type Sender<T> = mpsc::UnboundedSender<T>;
 type Receiver<T> = mpsc::UnboundedReceiver<T>;
 
 // utils start
-fn init_logging() {
+fn init_logging() -> Result<()> {
     let mut builder = Builder::from_default_env();
     builder.filter_level(LevelFilter::Debug);
     builder.format(|buf, record| {
@@ -57,7 +57,10 @@ fn init_logging() {
         )
     });
     builder.format_timestamp_micros();
-    builder.init();
+    builder.try_init().or_else(|e| {
+        debug!("Logging not initialized: {}", e);
+        Ok(())
+    })
 }
 
 fn spawn_and_log_error<F>(id: String, fut: F) -> task::JoinHandle<()>
@@ -76,7 +79,7 @@ where
 async fn accept_loop(addr: impl ToSocketAddrs) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     let (mut broker_sender, broker_receiver) = mpsc::unbounded();
-    let broker_handle = task::spawn(broker_loop(broker_receiver));
+    let broker_handle = task::spawn(broker_loop(broker_sender.clone(), broker_receiver));
     let mut incoming = listener.incoming();
     while let Some(stream) = incoming.next().await {
         // TODO: how to shutdown this?
@@ -87,7 +90,6 @@ async fn accept_loop(addr: impl ToSocketAddrs) -> Result<()> {
             .send(Event::NewClient {
                 id: id.to_string(),
                 stream,
-                broker_sender: broker_sender.clone(),
             })
             .await?;
     }
@@ -165,7 +167,6 @@ enum Event {
     NewClient {
         id: String,
         stream: Arc<TcpStream>,
-        broker_sender: Sender<Event>,
     },
     NewPeer {
         id: String,
@@ -186,7 +187,7 @@ enum Event {
 
 type WriterEntry = (String, Sender<String>);
 
-async fn broker_loop(events: Receiver<Event>) -> Result<()> {
+async fn broker_loop(broker_sender: Sender<Event>, events: Receiver<Event>) -> Result<()> {
     let mut ids_to_writer_entries: HashMap<String, WriterEntry> = HashMap::new();
     let mut names_to_ids: HashMap<String, String> = HashMap::new();
     let mut writers = Vec::new();
@@ -196,7 +197,7 @@ async fn broker_loop(events: Receiver<Event>) -> Result<()> {
         select! {
             event =  events.next() => match event {
                 Some(event) => {
-                    match_event(event, &mut ids_to_writer_entries,
+                    match_event(&broker_sender, event, &mut ids_to_writer_entries,
                      &mut names_to_ids, &mut writers).await?
                     }
                 None => break,
@@ -217,6 +218,7 @@ async fn broker_loop(events: Receiver<Event>) -> Result<()> {
 }
 
 async fn match_event(
+    broker_sender: &Sender<Event>,
     event: Event,
     ids_to_writer_entries: &mut HashMap<String, WriterEntry>,
     names_to_ids: &mut HashMap<String, String>,
@@ -224,11 +226,7 @@ async fn match_event(
 ) -> Result<()> {
     debug!("{:?}", event);
     match event {
-        Event::NewClient {
-            id,
-            stream,
-            broker_sender,
-        } => {
+        Event::NewClient { id, stream } => {
             info!("Accepting from: {}", id);
             match ids_to_writer_entries.entry(id.clone()) {
                 Entry::Occupied(..) => (), // TODO
@@ -237,7 +235,12 @@ async fn match_event(
                     let (shutdown_sender, shutdown_receiver) = mpsc::unbounded();
                     let reader_task_handle = spawn_and_log_error(
                         format!("reader: '{}'", id),
-                        reader_loop(id.clone(), broker_sender, stream.clone(), shutdown_sender),
+                        reader_loop(
+                            id.clone(),
+                            broker_sender.clone(),
+                            stream.clone(),
+                            shutdown_sender,
+                        ),
                     );
                     //                    spawn_and_log_error(
                     //                        format!("shutdown monitor: '{}'", id),
@@ -363,31 +366,73 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::any::Any;
+    use streamunordered::*;
 
     async fn receive_test(mut msg_receiver: Receiver<String>) -> bool {
-        select! {
-            msg = msg_receiver.next().fuse() => match msg {
-                Some(msg) => {
-                    assert!(msg == "test");
-                    eprintln!("Got test!");
-                    true
-                }
-                _ => false
-
-            }
+        let mut msgs: usize = 0;
+        while let Some(msg) = msg_receiver.next().await {
+            debug!("Got {}", msg);
+            msgs += 1;
         }
+        msgs == 2
     }
 
-    async fn select_queue() -> Result<()> {
+    async fn basic_queue_async() -> Result<()> {
         let (mut msg_sender, msg_receiver) = mpsc::unbounded();
         let spawned = task::spawn(receive_test(msg_receiver));
-        msg_sender.send("test".to_string()).await?;
+        msg_sender.send("test1".to_string()).await?;
+        msg_sender.send("test2".to_string()).await?;
+        drop(msg_sender);
         assert!(spawned.await);
         Ok(())
     }
 
     #[test]
     fn basic_queue() {
-        task::block_on(select_queue());
+        init_logging();
+        task::block_on(basic_queue_async());
+    }
+    //--------------
+
+    async fn receive_test_combined(mut combined: StreamUnordered<Receiver<String>>) -> bool {
+        let mut msgs: usize = 0;
+        while let Some((v, stream_token)) = combined.next().await {
+            if let StreamYield::Item(v) = v {
+                debug!("got {}", v);
+                msgs += 1;
+            } else if let StreamYield::Finished(finished_stream) = v {
+                // TODO: remove
+                //finished_stream.remove()
+                break;
+            }
+        }
+        msgs == 2
+    }
+
+    async fn streamunordered_async() -> Result<()> {
+        let mut combined: StreamUnordered<Receiver<String>> = Default::default();
+        let (mut msg_sender1, msg_receiver1): (Sender<String>, Receiver<String>) =
+            mpsc::unbounded();
+        let (mut msg_sender2, msg_receiver2): (Sender<String>, Receiver<String>) =
+            mpsc::unbounded();
+        combined.push(msg_receiver1);
+        combined.push(msg_receiver2);
+
+        let spawned = task::spawn(receive_test_combined(combined));
+
+        msg_sender1.send("test1".to_string()).await?;
+        msg_sender2.send("test2".to_string()).await?;
+        drop(msg_sender1);
+        drop(msg_sender2);
+
+        assert!(spawned.await);
+        Ok(())
+    }
+
+    #[test]
+    fn streamunordered() {
+        init_logging();
+        task::block_on(streamunordered_async());
     }
 }
