@@ -1,19 +1,18 @@
+#![feature(async_closure)]
 extern crate async_std;
 extern crate futures;
 #[macro_use]
 extern crate log;
 
 use std::io::Write;
-use std::time::Duration;
+
 use std::{
     collections::hash_map::{Entry, HashMap},
     sync::Arc,
 };
 
-use async_std::future;
-use async_std::future::TimeoutError;
 use async_std::task;
-use async_std::task::{sleep, spawn};
+
 use async_std::{
     io::BufReader,
     net::{TcpListener, TcpStream, ToSocketAddrs},
@@ -21,7 +20,7 @@ use async_std::{
 };
 use env_logger::Builder;
 use futures::channel::mpsc;
-use futures::future::join_all;
+
 use futures::future::TryFutureExt;
 use futures::sink::SinkExt;
 use futures::stream::TryStreamExt;
@@ -67,9 +66,12 @@ fn spawn_and_log_error<F>(id: String, fut: F) -> task::JoinHandle<()>
 where
     F: Future<Output = Result<()>> + Send + 'static,
 {
+    info!("Future {} started", id);
     task::spawn(async move {
         if let Err(e) = fut.await {
-            warn!("Future {} ended with error {}", id, e)
+            warn!("Future {} ended with error {}", id, e);
+        } else {
+            info!("Future {} ended", id);
         }
     })
 }
@@ -100,12 +102,7 @@ async fn accept_loop(addr: impl ToSocketAddrs) -> Result<()> {
 }
 
 // reader
-async fn reader_loop(
-    id: String,
-    mut broker: Sender<Event>,
-    stream: Arc<TcpStream>,
-    _shutdown_sender: Sender<Void>,
-) -> Result<()> {
+async fn reader_loop(id: String, mut broker: Sender<Event>, stream: Arc<TcpStream>) -> Result<()> {
     let reader = BufReader::new(&*stream);
     let mut lines = reader.lines();
     let name = match lines.next().await {
@@ -124,7 +121,7 @@ async fn reader_loop(
     while let Some(line) = lines.next().await {
         let line = line?;
         if let Some(idx) = line.find(':') {
-            let (dest, msg) = (&line[..idx], line[idx + 1..].trim());
+            let (_dest, _msg) = (&line[..idx], line[idx + 1..].trim());
             let (dest, mut msg) = line.split_at(idx);
             msg = &msg[1..];
             let dest: Vec<String> = dest
@@ -150,10 +147,7 @@ async fn reader_loop(
             break;
         }
     }
-    debug!("Reader {} is exitting", id);
-    // TODO: send event also on error, drop event, broker should listen on shutdown_receiver close
-    broker.send(Event::DisconnectedPeer { id }).await?;
-    // dropping shutdown_sender should kill writer actor
+    debug!("Reader {} is exiting", id);
     Ok(())
 }
 
@@ -232,22 +226,22 @@ async fn match_event(
                 Entry::Occupied(..) => (), // TODO
                 Entry::Vacant(entry) => {
                     // start reader that can send events to broker
-                    let (shutdown_sender, shutdown_receiver) = mpsc::unbounded();
-                    let reader_task_handle = spawn_and_log_error(
-                        format!("reader: '{}'", id),
-                        reader_loop(
-                            id.clone(),
-                            broker_sender.clone(),
-                            stream.clone(),
-                            shutdown_sender,
-                        ),
-                    );
-                    //                    spawn_and_log_error(
-                    //                        format!("shutdown monitor: '{}'", id),
-                    //                        async move || {
-                    //
-                    //                        }
-                    //                    );
+
+                    let future = {
+                        let mut broker_sender = broker_sender.clone();
+                        let id = id.clone();
+                        let stream = stream.clone();
+                        (async move || {
+                            let _ = reader_loop(id.clone(), broker_sender.clone(), stream).await;
+                            // no matter how reader finishes, send disconnected event
+                            broker_sender.send(Event::DisconnectedPeer { id }).await?;
+                            Ok(())
+                        })()
+                    };
+
+                    let _reader_task_handle =
+                        spawn_and_log_error(format!("reader: '{}'", id), future);
+                    // TODO: try and_then
 
                     // start writer that receives messages from broker
                     let (writer_sender, writer_receiver) = mpsc::unbounded();
@@ -255,7 +249,7 @@ async fn match_event(
 
                     let writer_task_handle = spawn_and_log_error(
                         format!("writer: '{}'", id),
-                        writer_loop(id.clone(), writer_receiver, stream, shutdown_receiver),
+                        writer_loop(writer_receiver, stream),
                     );
                     writers.push(writer_task_handle);
                 }
@@ -316,6 +310,7 @@ async fn match_event(
         }
         Event::DisconnectedPeer { id } => {
             debug!("Removing id:'{}'", id);
+            // free writer_sender so that writer dies.
             if let Some((name, _)) = ids_to_writer_entries.remove(&id) {
                 names_to_ids.remove(&name);
             }
@@ -325,40 +320,18 @@ async fn match_event(
 }
 
 // writer
-async fn writer_loop(
-    name: String,
-    messages: Receiver<String>,
-    stream: Arc<TcpStream>,
-    shutdown: Receiver<Void>,
-) -> Result<()> {
+async fn writer_loop(mut messages: Receiver<String>, stream: Arc<TcpStream>) -> Result<()> {
     let mut stream = &*stream;
-    let mut messages = messages.fuse(); // must be fused before loop
-    let mut shutdown = shutdown.fuse();
-    loop {
-        select! {
-            msg = messages.next().fuse() => match msg {
-                Some(msg) => {
-                stream.write_all(msg.as_bytes()).await?;
-                stream.write_all(b"\n").await?;
-                },
-                None => break, // TODO: how is reader notified?
-            },
-            void = shutdown.next().fuse() => match void {
-                Some(void) => match void {}, // should never happen
-                None => break, // shutdown channel closed
-            }
-        }
+    while let Some(msg) = messages.next().await {
+        stream.write_all(msg.as_bytes()).await?;
+        stream.write_all(b"\n").await?;
     }
-    info!("{} exitting", name);
-    //    while let Some(msg) = messages.next().await {
-    //        stream.write_all(msg.as_bytes()).await?;
-    //    }
     Ok(())
 }
 
 #[async_std::main]
 async fn main() -> Result<()> {
-    init_logging();
+    init_logging().expect("Cannot init logging");
     let fut = accept_loop("127.0.0.1:8080");
     task::block_on(fut)
 }
@@ -366,7 +339,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::any::Any;
+
     use streamunordered::*;
 
     async fn receive_test(mut msg_receiver: Receiver<String>) -> bool {
@@ -390,18 +363,18 @@ mod tests {
 
     #[test]
     fn basic_queue() {
-        init_logging();
-        task::block_on(basic_queue_async());
+        init_logging().expect("Cannot init logging");
+        task::block_on(basic_queue_async()).expect("Cannot execute test");
     }
     //--------------
 
     async fn receive_test_combined(mut combined: StreamUnordered<Receiver<String>>) -> bool {
         let mut msgs: usize = 0;
-        while let Some((v, stream_token)) = combined.next().await {
+        while let Some((v, _stream_token)) = combined.next().await {
             if let StreamYield::Item(v) = v {
                 debug!("got {}", v);
                 msgs += 1;
-            } else if let StreamYield::Finished(finished_stream) = v {
+            } else if let StreamYield::Finished(_finished_stream) = v {
                 // TODO: remove
                 //finished_stream.remove()
                 break;
@@ -432,7 +405,7 @@ mod tests {
 
     #[test]
     fn streamunordered() {
-        init_logging();
-        task::block_on(streamunordered_async());
+        init_logging().expect("Cannot init logging");
+        task::block_on(streamunordered_async()).expect("Cannot execute test");
     }
 }
