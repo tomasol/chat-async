@@ -121,7 +121,6 @@ async fn reader_loop(id: String, mut broker: Sender<Event>, stream: Arc<TcpStrea
     while let Some(line) = lines.next().await {
         let line = line?;
         if let Some(idx) = line.find(':') {
-            let (_dest, _msg) = (&line[..idx], line[idx + 1..].trim());
             let (dest, mut msg) = line.split_at(idx);
             msg = &msg[1..];
             let dest: Vec<String> = dest
@@ -135,13 +134,9 @@ async fn reader_loop(id: String, mut broker: Sender<Event>, stream: Arc<TcpStrea
                     to_names: dest,
                     msg,
                 })
-                .await
-                .unwrap(); // awaiting on what? broker or receivers?
+                .await?; // awaiting on what? broker or receivers?
         } else if line == "/w" {
-            broker
-                .send(Event::ListAllUsers { id: id.clone() })
-                .await
-                .unwrap();
+            broker.send(Event::ListAllUsers { id: id.clone() }).await?;
         } else if line == "/q" {
             debug!("Client {} requested quit", name);
             break;
@@ -181,27 +176,42 @@ enum Event {
 
 type WriterEntry = (String, Sender<String>);
 
-async fn broker_loop(broker_sender: Sender<Event>, events: Receiver<Event>) -> Result<()> {
+async fn broker_loop(broker_sender: Sender<Event>, mut events: Receiver<Event>) -> Result<()> {
     let mut ids_to_writer_entries: HashMap<String, WriterEntry> = HashMap::new();
     let mut names_to_ids: HashMap<String, String> = HashMap::new();
     let mut writers = Vec::new();
 
-    let mut events = events.fuse();
-    loop {
-        select! {
-            event =  events.next() => match event {
-                Some(event) => {
-                    match_event(&broker_sender, event, &mut ids_to_writer_entries,
-                     &mut names_to_ids, &mut writers).await?
-                    }
-                None => break,
+    while let Some(event) = events.next().await {
+        debug!("{:?}", event);
+        match event {
+            Event::NewClient { id, stream } => new_client(
+                id,
+                stream,
+                &broker_sender,
+                &mut ids_to_writer_entries,
+                &mut writers,
+            ),
+            Event::NewPeer { id, name } => {
+                new_peer(id, name, &mut ids_to_writer_entries, &mut names_to_ids)
             }
-        }
+            Event::Message { id, to_names, msg } => {
+                message(
+                    id,
+                    to_names,
+                    msg,
+                    &mut ids_to_writer_entries,
+                    &mut names_to_ids,
+                )
+                .await
+            }
+            Event::ListAllUsers { id } => {
+                list_all_users(id, &mut ids_to_writer_entries, &mut names_to_ids).await
+            }
+            Event::DisconnectedPeer { id } => {
+                disconnected_peer(id, &mut ids_to_writer_entries, &mut names_to_ids)
+            }
+        }?;
     }
-
-    //    while let Some(event) = events.next().await {
-    //        matchEvent(event, &mut peers, &mut writers).await;
-    //    }
     info!("Dropping peers");
     drop(ids_to_writer_entries);
     // all task spawned by this should be waited for
@@ -211,110 +221,130 @@ async fn broker_loop(broker_sender: Sender<Event>, events: Receiver<Event>) -> R
     Ok(())
 }
 
-async fn match_event(
+fn new_client(
+    id: String,
+    stream: Arc<TcpStream>,
     broker_sender: &Sender<Event>,
-    event: Event,
     ids_to_writer_entries: &mut HashMap<String, WriterEntry>,
-    names_to_ids: &mut HashMap<String, String>,
     writers: &mut Vec<task::JoinHandle<()>>,
 ) -> Result<()> {
-    debug!("{:?}", event);
-    match event {
-        Event::NewClient { id, stream } => {
-            info!("Accepting from: {}", id);
-            match ids_to_writer_entries.entry(id.clone()) {
-                Entry::Occupied(..) => (), // TODO
-                Entry::Vacant(entry) => {
-                    // start reader that can send events to broker
+    info!("Accepting from: {}", id);
+    match ids_to_writer_entries.entry(id.clone()) {
+        Entry::Occupied(..) => Ok(()), // TODO
+        Entry::Vacant(entry) => {
+            // start reader that can send events to broker
 
-                    let future = {
-                        let mut broker_sender = broker_sender.clone();
-                        let id = id.clone();
-                        let stream = stream.clone();
-                        (async move || {
-                            let _ = reader_loop(id.clone(), broker_sender.clone(), stream).await;
-                            // no matter how reader finishes, send disconnected event
-                            broker_sender.send(Event::DisconnectedPeer { id }).await?;
-                            Ok(())
-                        })()
-                    };
+            let future = {
+                let mut broker_sender = broker_sender.clone();
+                let id = id.clone();
+                let stream = stream.clone();
+                (async move || {
+                    let _ = reader_loop(id.clone(), broker_sender.clone(), stream).await;
+                    // no matter how reader finishes, send disconnected event
+                    broker_sender.send(Event::DisconnectedPeer { id }).await?;
+                    Ok(())
+                })()
+            };
 
-                    let _reader_task_handle =
-                        spawn_and_log_error(format!("reader: '{}'", id), future);
-                    // TODO: try and_then
+            let _reader_task_handle = spawn_and_log_error(format!("reader: '{}'", id), future);
 
-                    // start writer that receives messages from broker
-                    let (writer_sender, writer_receiver) = mpsc::unbounded();
-                    entry.insert(("unknown".to_string(), writer_sender));
+            // start writer that receives messages from broker
+            let (writer_sender, writer_receiver) = mpsc::unbounded();
+            entry.insert(("unknown".to_string(), writer_sender));
 
-                    let writer_task_handle = spawn_and_log_error(
-                        format!("writer: '{}'", id),
-                        writer_loop(writer_receiver, stream),
-                    );
-                    writers.push(writer_task_handle);
-                }
-            }
+            let writer_task_handle = spawn_and_log_error(
+                format!("writer: '{}'", id),
+                writer_loop(writer_receiver, stream),
+            );
+            writers.push(writer_task_handle);
+            Ok(())
         }
-        Event::NewPeer { id, name } => {
-            info!("Id: '{}' name: '{}'", id, name);
-            names_to_ids.insert(name.clone(), id.clone());
-            if let Some((old_name, writer)) = ids_to_writer_entries.remove(&id) {
-                debug!(
-                    "Id: '{}' updating old name '{}' to '{}'",
-                    id, old_name, name
-                );
-                ids_to_writer_entries.insert(id, (name, writer));
-            }
-        }
-        Event::Message { id, to_names, msg } => {
-            for receiver_name in to_names {
-                let mut sent_to_channel: bool = false;
-                if let Some(receiver_id) = names_to_ids.get(receiver_name.as_str()) {
-                    if let Some((sender_name, receiver_channel)) =
-                        ids_to_writer_entries.get_mut(receiver_id.as_str())
-                    {
-                        let msg = format!("Got message from '{}': {}", sender_name, msg);
-                        // TODO spawn instead?
-                        sent_to_channel = match receiver_channel.send(msg).await {
-                            Ok(_) => true,
-                            Err(_) => false,
-                        }
-                    } else {
-                        error!("Cannot find name of sender with id:'{}'", id);
-                    }
+    }
+}
+
+fn new_peer(
+    id: String,
+    name: String,
+    ids_to_writer_entries: &mut HashMap<String, WriterEntry>,
+    names_to_ids: &mut HashMap<String, String>,
+) -> Result<()> {
+    info!("Id: '{}' name: '{}'", id, name);
+    names_to_ids.insert(name.clone(), id.clone());
+    if let Some((old_name, writer)) = ids_to_writer_entries.remove(&id) {
+        debug!(
+            "Id: '{}' updating old name '{}' to '{}'",
+            id, old_name, name
+        );
+        ids_to_writer_entries.insert(id, (name, writer));
+    }
+    Ok(())
+}
+
+async fn message(
+    id: String,
+    to_names: Vec<String>,
+    msg: String,
+    ids_to_writer_entries: &mut HashMap<String, WriterEntry>,
+    names_to_ids: &mut HashMap<String, String>,
+) -> Result<()> {
+    for receiver_name in to_names {
+        let mut sent_to_channel: bool = false;
+        if let Some(receiver_id) = names_to_ids.get(receiver_name.as_str()) {
+            if let Some((sender_name, receiver_channel)) =
+                ids_to_writer_entries.get_mut(receiver_id.as_str())
+            {
+                let msg = format!("Got message from '{}': {}", sender_name, msg);
+                // TODO spawn instead?
+                sent_to_channel = match receiver_channel.send(msg).await {
+                    Ok(_) => true,
+                    Err(_) => false,
                 }
-                if !sent_to_channel {
-                    // send not found to sender of this message, send back warning
-                    if let Some((_, sender_channel)) = ids_to_writer_entries.get_mut(id.as_str()) {
-                        let msg = format!("not found: {}", receiver_name);
-                        sender_channel.send(msg).await?
-                    } else {
-                        warn!("Sender id:'{}' not found, dropping message", id);
-                    }
-                }
-            }
-        }
-        Event::ListAllUsers { id } => {
-            let all_users: String = names_to_ids
-                .keys()
-                .into_iter()
-                .map(|x| x.as_str())
-                .collect::<Vec<&str>>()
-                .join(",");
-            debug!("All users: {}", all_users);
-            if let Some((_, writer_sender)) = ids_to_writer_entries.get_mut(id.as_str()) {
-                writer_sender.send(all_users).await?
             } else {
-                warn!("Cannot find writer for id:'{}', dropping message", id);
+                error!("Cannot find name of sender with id:'{}'", id);
             }
         }
-        Event::DisconnectedPeer { id } => {
-            debug!("Removing id:'{}'", id);
-            // free writer_sender so that writer dies.
-            if let Some((name, _)) = ids_to_writer_entries.remove(&id) {
-                names_to_ids.remove(&name);
+        if !sent_to_channel {
+            // send not found to sender of this message, send back warning
+            if let Some((_, sender_channel)) = ids_to_writer_entries.get_mut(id.as_str()) {
+                let msg = format!("not found: {}", receiver_name);
+                sender_channel.send(msg).await?
+            } else {
+                warn!("Sender id:'{}' not found, dropping message", id);
             }
         }
+    }
+    Ok(())
+}
+
+async fn list_all_users(
+    id: String,
+    ids_to_writer_entries: &mut HashMap<String, WriterEntry>,
+    names_to_ids: &mut HashMap<String, String>,
+) -> Result<()> {
+    let all_users: String = names_to_ids
+        .keys()
+        .into_iter()
+        .map(|x| x.as_str())
+        .collect::<Vec<&str>>()
+        .join(",");
+    debug!("All users: {}", all_users);
+    if let Some((_, writer_sender)) = ids_to_writer_entries.get_mut(id.as_str()) {
+        writer_sender.send(all_users).await?
+    } else {
+        warn!("Cannot find writer for id:'{}', dropping message", id);
+    }
+    Ok(())
+}
+
+fn disconnected_peer(
+    id: String,
+    ids_to_writer_entries: &mut HashMap<String, WriterEntry>,
+    names_to_ids: &mut HashMap<String, String>,
+) -> Result<()> {
+    debug!("Removing id:'{}'", id);
+    // free writer_sender so that writer dies.
+    if let Some((name, _)) = ids_to_writer_entries.remove(&id) {
+        names_to_ids.remove(&name);
     }
     Ok(())
 }
