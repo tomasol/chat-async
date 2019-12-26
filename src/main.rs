@@ -21,15 +21,9 @@ use async_std::{
 use env_logger::Builder;
 use futures::channel::mpsc;
 
-use futures::future::TryFutureExt;
 use futures::sink::SinkExt;
-use futures::stream::TryStreamExt;
-use futures::{
-    future::{Fuse, FusedFuture, FutureExt},
-    pin_mut, select,
-    stream::{FusedStream, FuturesUnordered, Stream, StreamExt},
-};
-use futures::{AsyncReadExt, Future};
+use futures::stream::StreamExt;
+use futures::Future;
 use log::LevelFilter;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
