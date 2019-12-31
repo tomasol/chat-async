@@ -21,10 +21,13 @@ use async_std::{
 use env_logger::Builder;
 use futures::channel::mpsc;
 
+use futures::select;
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 use futures::Future;
 use log::LevelFilter;
+
+use streamunordered::*;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type Sender<T> = mpsc::UnboundedSender<T>;
@@ -42,7 +45,7 @@ fn init_logging() -> Result<()> {
         writeln!(
             buf,
             "{} {} {:?} {} - {}",
-            buf.timestamp_millis(),
+            buf.timestamp_micros(),
             file,
             std::thread::current().id(),
             record.level(),
@@ -72,24 +75,42 @@ where
 
 // utils end
 
-async fn accept_loop(addr: impl ToSocketAddrs) -> Result<()> {
+async fn accept_loop(addr: impl ToSocketAddrs, shutdown_receiver: Receiver<Void>) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
+    let mut combined: StreamUnordered<Receiver<Event>> = Default::default();
     let (mut broker_sender, broker_receiver) = mpsc::unbounded();
-    let broker_handle = task::spawn(broker_loop(broker_sender.clone(), broker_receiver));
-    let mut incoming = listener.incoming();
-    while let Some(stream) = incoming.next().await {
-        // TODO: how to shutdown this?
-        let stream = stream?;
-        let stream = Arc::new(stream);
-        let id = stream.peer_addr()?;
-        broker_sender
-            .send(Event::NewClient {
-                id: id.to_string(),
-                stream,
-            })
-            .await?;
+    let (internal_sender, internal_receiver) = mpsc::unbounded();
+    combined.push(broker_receiver);
+    combined.push(internal_receiver);
+    let broker_handle = task::spawn(broker_loop(internal_sender, combined));
+    let mut incoming = listener.incoming().fuse();
+    let mut shutdown_receiver = shutdown_receiver.fuse();
+    loop {
+        select! {
+            msg = incoming.next() => match msg {
+                Some(stream) => {
+                    let stream = stream?;
+                    let stream = Arc::new(stream);
+                    let id = stream.peer_addr()?;
+                    broker_sender
+                        .send(Event::NewClient {
+                            id: id.to_string(),
+                            stream,
+                        })
+                        .await?;
+                },
+                None => {
+                    debug!("TCP listener closed");
+                    break;
+                },
+            },
+            void = shutdown_receiver.next() => match void {
+                Some(void) => match void {}, // nothing can happen here
+                None => break,
+            }
+        }
     }
-    info!("Dropping broker");
+    info!("Shutting down accept loop");
     drop(broker_sender);
     broker_handle.await?;
     Ok(())
@@ -143,7 +164,7 @@ async fn reader_loop(id: String, mut broker: Sender<Event>, stream: Arc<TcpStrea
 // broker
 
 #[derive(Debug)]
-enum Void {}
+enum Void {} // https://doc.rust-lang.org/nomicon/exotic-sizes.html#empty-types
 
 #[derive(Debug)]
 enum Event {
@@ -170,45 +191,54 @@ enum Event {
 
 type WriterEntry = (String, Sender<String>);
 
-async fn broker_loop(broker_sender: Sender<Event>, mut events: Receiver<Event>) -> Result<()> {
+async fn broker_loop(
+    broker_sender: Sender<Event>,
+    /* mut events: Receiver<Event>, */
+    mut combined: StreamUnordered<Receiver<Event>>,
+) -> Result<()> {
     let mut ids_to_writer_entries: HashMap<String, WriterEntry> = HashMap::new();
     let mut names_to_ids: HashMap<String, String> = HashMap::new();
     let mut writers = Vec::new();
 
-    while let Some(event) = events.next().await {
-        debug!("{:?}", event);
-        match event {
-            Event::NewClient { id, stream } => new_client(
-                id,
-                stream,
-                &broker_sender,
-                &mut ids_to_writer_entries,
-                &mut writers,
-            ),
-            Event::NewPeer { id, name } => {
-                new_peer(id, name, &mut ids_to_writer_entries, &mut names_to_ids)
-            }
-            Event::Message { id, to_names, msg } => {
-                message(
+    while let Some((v, _stream_token)) = combined.next().await {
+        if let StreamYield::Item(event) = v {
+            debug!("{:?}", event);
+            match event {
+                Event::NewClient { id, stream } => new_client(
                     id,
-                    to_names,
-                    msg,
+                    stream,
+                    &broker_sender,
                     &mut ids_to_writer_entries,
-                    &mut names_to_ids,
-                )
-                .await
-            }
-            Event::ListAllUsers { id } => {
-                list_all_users(id, &mut ids_to_writer_entries, &mut names_to_ids).await
-            }
-            Event::DisconnectedPeer { id } => {
-                disconnected_peer(id, &mut ids_to_writer_entries, &mut names_to_ids)
-            }
-        }?;
+                    &mut writers,
+                ),
+                Event::NewPeer { id, name } => {
+                    new_peer(id, name, &mut ids_to_writer_entries, &mut names_to_ids)
+                }
+                Event::Message { id, to_names, msg } => {
+                    message(
+                        id,
+                        to_names,
+                        msg,
+                        &mut ids_to_writer_entries,
+                        &mut names_to_ids,
+                    )
+                    .await
+                }
+                Event::ListAllUsers { id } => {
+                    list_all_users(id, &mut ids_to_writer_entries, &mut names_to_ids).await
+                }
+                Event::DisconnectedPeer { id } => {
+                    disconnected_peer(id, &mut ids_to_writer_entries, &mut names_to_ids)
+                }
+            }?;
+        } else if let StreamYield::Finished(_finished_stream) = v {
+            debug!("Shutting down broker");
+            break;
+        }
     }
-    info!("Dropping peers");
+    // drop senders
     drop(ids_to_writer_entries);
-    // all task spawned by this should be waited for
+    info!("Waiting for writers to finish");
     for writer in writers {
         writer.await;
     }
@@ -356,6 +386,96 @@ async fn writer_loop(mut messages: Receiver<String>, stream: Arc<TcpStream>) -> 
 #[async_std::main]
 async fn main() -> Result<()> {
     init_logging().expect("Cannot init logging");
-    let fut = accept_loop("127.0.0.1:8080");
+    let (_shutdown_sender, shutdown_receiver) = mpsc::unbounded();
+    let fut = accept_loop("127.0.0.1:8080", shutdown_receiver);
     task::block_on(fut)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn client_server() -> Result<()> {
+        init_logging().expect("Cannot init logging");
+        let fut = async || -> Result<()> {
+            let addr = "127.0.0.1:8081";
+            let (shutdown_sender, shutdown_receiver) = mpsc::unbounded();
+            let accept_loop = spawn_and_log_error(
+                "accept_loop".to_string(),
+                accept_loop(addr, shutdown_receiver),
+            );
+            // start client
+            let stream = TcpStream::connect(addr).await?;
+            let (reader, mut writer) = (&stream, &stream);
+            writer.write_all(b"joe\n").await?;
+            writer.write_all(b"/w\n").await?;
+            let mut lines_from_server = BufReader::new(reader).lines();
+            let line = match lines_from_server.next().await {
+                Some(line) => line?,
+                _ => panic!("no line"),
+            };
+            assert_eq!("joe", line);
+            writer.write_all(b"/q\n").await?;
+            drop(shutdown_sender);
+            debug!("Waiting for accept loop to finish");
+            accept_loop.await;
+            debug!("Finished");
+            Ok(())
+        }();
+        task::block_on(fut)?;
+
+        task::block_on(async {
+            task::sleep(Duration::from_millis(1000)).await;
+        });
+        Ok(())
+    }
+
+    async fn receive_test_combined(mut combined: StreamUnordered<Receiver<String>>) -> bool {
+        let mut msgs: usize = 0;
+        let mut broken_streams = 0;
+        while let Some((v, _stream_token)) = combined.next().await {
+            if let StreamYield::Item(v) = v {
+                debug!("got {}", v);
+                msgs += 1;
+            } else if let StreamYield::Finished(_finished_stream) = v {
+                // TODO: remove
+                //finished_stream.remove()
+                debug!("Stream finished");
+                broken_streams += 1;
+                if broken_streams == 2 {
+                    break;
+                }
+            }
+        }
+        msgs == 2
+    }
+
+    async fn streamunordered_async() -> Result<()> {
+        let mut combined: StreamUnordered<Receiver<String>> = Default::default();
+        let (mut msg_sender1, msg_receiver1): (Sender<String>, Receiver<String>) =
+            mpsc::unbounded();
+        let (mut msg_sender2, msg_receiver2): (Sender<String>, Receiver<String>) =
+            mpsc::unbounded();
+        combined.push(msg_receiver1);
+        combined.push(msg_receiver2);
+
+        let spawned = task::spawn(receive_test_combined(combined));
+
+        msg_sender1.send("test1".to_string()).await?;
+        drop(msg_sender1);
+        task::sleep(Duration::from_millis(100)).await;
+        msg_sender2.send("test2".to_string()).await?;
+        drop(msg_sender2);
+
+        assert!(spawned.await);
+        Ok(())
+    }
+
+    #[test]
+    fn streamunordered() {
+        init_logging().expect("Cannot init logging");
+        task::block_on(streamunordered_async()).expect("Cannot execute test");
+    }
 }
