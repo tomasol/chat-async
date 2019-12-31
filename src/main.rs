@@ -82,9 +82,12 @@ async fn accept_loop(addr: impl ToSocketAddrs, shutdown_receiver: Receiver<Void>
     let (internal_sender, internal_receiver) = mpsc::unbounded();
     combined.push(broker_receiver);
     combined.push(internal_receiver);
+    // Broker will listen on combined receiver and can pass internal sender to its subactors.
+    // Closing broker_sender will notify broker to shut down.
     let broker_handle = task::spawn(broker_loop(internal_sender, combined));
     let mut incoming = listener.incoming().fuse();
     let mut shutdown_receiver = shutdown_receiver.fuse();
+    // listen on both shutdown and new tcp client connection
     loop {
         select! {
             msg = incoming.next() => match msg {
@@ -192,8 +195,7 @@ enum Event {
 type WriterEntry = (String, Sender<String>);
 
 async fn broker_loop(
-    broker_sender: Sender<Event>,
-    /* mut events: Receiver<Event>, */
+    broker_internal_sender: Sender<Event>,
     mut combined: StreamUnordered<Receiver<Event>>,
 ) -> Result<()> {
     let mut ids_to_writer_entries: HashMap<String, WriterEntry> = HashMap::new();
@@ -207,7 +209,7 @@ async fn broker_loop(
                 Event::NewClient { id, stream } => new_client(
                     id,
                     stream,
-                    &broker_sender,
+                    &broker_internal_sender,
                     &mut ids_to_writer_entries,
                     &mut writers,
                 ),
@@ -236,7 +238,10 @@ async fn broker_loop(
             break;
         }
     }
-    // drop senders
+    // FIXME: does not work:
+    // Droping broker_internal_sender should shut down reader actors
+    drop(broker_internal_sender);
+    // Drop writer_senders so that writer_loop actors which have writer_receiver will shut down.
     drop(ids_to_writer_entries);
     info!("Waiting for writers to finish");
     for writer in writers {
@@ -245,6 +250,7 @@ async fn broker_loop(
     Ok(())
 }
 
+// Spawn both reader_loop and writer_loop for this tcp stream.
 fn new_client(
     id: String,
     stream: Arc<TcpStream>,
@@ -417,7 +423,6 @@ mod tests {
                 _ => panic!("no line"),
             };
             assert_eq!("joe", line);
-            writer.write_all(b"/q\n").await?;
             drop(shutdown_sender);
             debug!("Waiting for accept loop to finish");
             accept_loop.await;
@@ -425,10 +430,6 @@ mod tests {
             Ok(())
         }();
         task::block_on(fut)?;
-
-        task::block_on(async {
-            task::sleep(Duration::from_millis(1000)).await;
-        });
         Ok(())
     }
 
