@@ -1,4 +1,5 @@
 #![feature(async_closure)]
+#![recursion_limit = "256"]
 extern crate async_std;
 extern crate futures;
 #[macro_use]
@@ -6,6 +7,7 @@ extern crate log;
 
 use std::io::Write;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     collections::hash_map::{Entry, HashMap},
     sync::Arc,
@@ -59,12 +61,16 @@ fn init_logging() -> Result<()> {
     })
 }
 
+static GLOBAL_TASK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 fn spawn_and_log_error<F>(id: String, fut: F) -> task::JoinHandle<()>
 where
     F: Future<Output = Result<()>> + Send + 'static,
 {
     info!("Future {} started", id);
+    GLOBAL_TASK_COUNT.fetch_add(1, Ordering::SeqCst);
     task::spawn(async move {
+        GLOBAL_TASK_COUNT.fetch_sub(1, Ordering::SeqCst);
         if let Err(e) = fut.await {
             warn!("Future {} ended with error {}", id, e);
         } else {
@@ -77,14 +83,10 @@ where
 
 async fn accept_loop(addr: impl ToSocketAddrs, shutdown_receiver: Receiver<Void>) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
-    let mut combined: StreamUnordered<Receiver<Event>> = Default::default();
     let (mut broker_sender, broker_receiver) = mpsc::unbounded();
-    let (internal_sender, internal_receiver) = mpsc::unbounded();
-    combined.push(broker_receiver);
-    combined.push(internal_receiver);
     // Broker will listen on combined receiver and can pass internal sender to its subactors.
     // Closing broker_sender will notify broker to shut down.
-    let broker_handle = task::spawn(broker_loop(internal_sender, combined));
+    let broker_handle = task::spawn(broker_loop(broker_receiver));
     let mut incoming = listener.incoming().fuse();
     let mut shutdown_receiver = shutdown_receiver.fuse();
     // listen on both shutdown and new tcp client connection
@@ -109,7 +111,10 @@ async fn accept_loop(addr: impl ToSocketAddrs, shutdown_receiver: Receiver<Void>
             },
             void = shutdown_receiver.next() => match void {
                 Some(void) => match void {}, // nothing can happen here
-                None => break,
+                None => {
+                    debug!("Accept loop recievied shutdown request");
+                    break;
+                },
             }
         }
     }
@@ -120,15 +125,20 @@ async fn accept_loop(addr: impl ToSocketAddrs, shutdown_receiver: Receiver<Void>
 }
 
 // reader
-async fn reader_loop(id: String, mut broker: Sender<Event>, stream: Arc<TcpStream>) -> Result<()> {
+async fn reader_loop(
+    id: String,
+    mut broker: Sender<Event>,
+    stream: Arc<TcpStream>,
+    shutdown_receiver: Receiver<Void>,
+) -> Result<()> {
     let reader = BufReader::new(&*stream);
     let mut lines = reader.lines();
+    // FIXME: shutdown does not propagate here
     let name = match lines.next().await {
         None => Err("peer disconnected immediately")?,
         Some(line) => line?,
     };
-    debug!("name = {}", name);
-
+    debug!("Reader {}: setting name to '{}'", id, name);
     broker
         .send(Event::NewPeer {
             id: id.clone(),
@@ -136,31 +146,50 @@ async fn reader_loop(id: String, mut broker: Sender<Event>, stream: Arc<TcpStrea
         })
         .await?;
 
-    while let Some(line) = lines.next().await {
-        let line = line?;
-        if let Some(idx) = line.find(':') {
-            let (dest, mut msg) = line.split_at(idx);
-            msg = &msg[1..];
-            let dest: Vec<String> = dest
-                .split(',')
-                .map(|name| name.trim().to_string())
-                .collect();
-            let msg: String = msg.to_string();
-            broker
-                .send(Event::Message {
-                    id: id.clone(),
-                    to_names: dest,
-                    msg,
-                })
-                .await?; // awaiting on what? broker or receivers?
-        } else if line == "/w" {
-            broker.send(Event::ListAllUsers { id: id.clone() }).await?;
-        } else if line == "/q" {
-            debug!("Client {} requested quit", name);
-            break;
+    let mut lines = lines.fuse();
+    let mut shutdown_receiver = shutdown_receiver.fuse();
+    // listen on both shutdown and new tcp client connection
+    loop {
+        select! {
+            line = lines.next() => match line {
+                Some(line) => {
+                    let line = line?;
+                    if let Some(idx) = line.find(':') {
+                        let (dest, mut msg) = line.split_at(idx);
+                        msg = &msg[1..];
+                        let dest: Vec<String> = dest
+                            .split(',')
+                            .map(|name| name.trim().to_string())
+                            .collect();
+                        let msg: String = msg.to_string();
+                        broker
+                            .send(Event::Message {
+                                id: id.clone(),
+                                to_names: dest,
+                                msg,
+                            })
+                            .await?; // awaiting on what? broker or receivers?
+                    } else if line == "/w" {
+                        broker.send(Event::ListAllUsers { id: id.clone() }).await?;
+                    } else if line == "/q" {
+                        debug!("Reader {}: Client {} requested quit", id, name);
+                        break;
+                    }
+                },
+                None => {
+                    debug!("Reader {}: TCP connection closed", id);
+                    break;
+                }
+            },
+            void = shutdown_receiver.next() => match void {
+                Some(void) => match void {}, // nothing can happen here
+                None => {
+                    debug!("Reader {}: received shutdown", id);
+                    break;
+                },
+            }
         }
     }
-    debug!("Reader {} is exiting", id);
     Ok(())
 }
 
@@ -194,25 +223,32 @@ enum Event {
 
 type WriterEntry = (String, Sender<String>);
 
-async fn broker_loop(
-    broker_internal_sender: Sender<Event>,
-    mut combined: StreamUnordered<Receiver<Event>>,
-) -> Result<()> {
+async fn broker_loop(broker_receiver: Receiver<Event>) -> Result<()> {
     let mut ids_to_writer_entries: HashMap<String, WriterEntry> = HashMap::new();
     let mut names_to_ids: HashMap<String, String> = HashMap::new();
-    let mut writers = Vec::new();
+    let mut task_handles = Vec::new();
+    let (internal_sender, internal_receiver) = mpsc::unbounded();
+    let mut combined: StreamUnordered<Receiver<Event>> = Default::default();
+    combined.push(broker_receiver);
+    combined.push(internal_receiver);
+    let mut reader_shutdown_senders = vec![];
 
     while let Some((v, _stream_token)) = combined.next().await {
         if let StreamYield::Item(event) = v {
             debug!("{:?}", event);
             match event {
-                Event::NewClient { id, stream } => new_client(
-                    id,
-                    stream,
-                    &broker_internal_sender,
-                    &mut ids_to_writer_entries,
-                    &mut writers,
-                ),
+                Event::NewClient { id, stream } => {
+                    let (reader_shutdown_sender, reader_shutdown_receiver) = mpsc::unbounded();
+                    reader_shutdown_senders.push(reader_shutdown_sender);
+                    new_client(
+                        id,
+                        stream,
+                        &internal_sender,
+                        reader_shutdown_receiver,
+                        &mut ids_to_writer_entries,
+                        &mut task_handles,
+                    )
+                }
                 Event::NewPeer { id, name } => {
                     new_peer(id, name, &mut ids_to_writer_entries, &mut names_to_ids)
                 }
@@ -234,18 +270,19 @@ async fn broker_loop(
                 }
             }?;
         } else if let StreamYield::Finished(_finished_stream) = v {
-            debug!("Shutting down broker");
+            debug!("Broker recievied shutdown request");
             break;
         }
     }
-    // FIXME: does not work:
-    // Droping broker_internal_sender should shut down reader actors
-    drop(broker_internal_sender);
+    // Shut down reader actors
+    drop(reader_shutdown_senders);
+
     // Drop writer_senders so that writer_loop actors which have writer_receiver will shut down.
     drop(ids_to_writer_entries);
-    info!("Waiting for writers to finish");
-    for writer in writers {
-        writer.await;
+
+    info!("Waiting for task_handles to finish");
+    for task_handle in task_handles {
+        task_handle.await;
     }
     Ok(())
 }
@@ -255,8 +292,9 @@ fn new_client(
     id: String,
     stream: Arc<TcpStream>,
     broker_sender: &Sender<Event>,
+    shutdown_receiver: Receiver<Void>,
     ids_to_writer_entries: &mut HashMap<String, WriterEntry>,
-    writers: &mut Vec<task::JoinHandle<()>>,
+    task_handles: &mut Vec<task::JoinHandle<()>>,
 ) -> Result<()> {
     info!("Accepting from: {}", id);
     match ids_to_writer_entries.entry(id.clone()) {
@@ -269,14 +307,17 @@ fn new_client(
                 let id = id.clone();
                 let stream = stream.clone();
                 (async move || {
-                    let _ = reader_loop(id.clone(), broker_sender.clone(), stream).await;
+                    let _ =
+                        reader_loop(id.clone(), broker_sender.clone(), stream, shutdown_receiver)
+                            .await;
                     // no matter how reader finishes, send disconnected event
                     broker_sender.send(Event::DisconnectedPeer { id }).await?;
                     Ok(())
                 })()
             };
 
-            let _reader_task_handle = spawn_and_log_error(format!("reader: '{}'", id), future);
+            let reader_task_handle = spawn_and_log_error(format!("reader: '{}'", id), future);
+            task_handles.push(reader_task_handle);
 
             // start writer that receives messages from broker
             let (writer_sender, writer_receiver) = mpsc::unbounded();
@@ -286,7 +327,7 @@ fn new_client(
                 format!("writer: '{}'", id),
                 writer_loop(writer_receiver, stream),
             );
-            writers.push(writer_task_handle);
+            task_handles.push(writer_task_handle);
             Ok(())
         }
     }
@@ -478,5 +519,6 @@ mod tests {
     fn streamunordered() {
         init_logging().expect("Cannot init logging");
         task::block_on(streamunordered_async()).expect("Cannot execute test");
+        assert_eq!(GLOBAL_TASK_COUNT.load(Ordering::SeqCst), 0);
     }
 }
