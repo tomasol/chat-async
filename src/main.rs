@@ -281,7 +281,7 @@ fn new_client(
     info!("Accepting from: {}", id);
     open_tcp_connections.insert(id.clone(), Arc::downgrade(&stream));
     match ids_to_writer_entries.entry(id.clone()) {
-        Entry::Occupied(..) => Ok(()), // TODO
+        Entry::Occupied(..) => Ok(()), // TODO same id was already taken?
         Entry::Vacant(entry) => {
             // start reader that can send events to broker
 
@@ -346,7 +346,6 @@ async fn message(
                 ids_to_writer_entries.get_mut(receiver_id.as_str())
             {
                 let msg = format!("Got message from '{}': {}", sender_name, msg);
-                // TODO spawn instead?
                 sent_to_channel = match receiver_channel.send(msg).await {
                     Ok(_) => true,
                     Err(_) => false,
@@ -465,7 +464,7 @@ mod tests {
                 debug!("got {}", v);
                 msgs += 1;
             } else if let StreamYield::Finished(_finished_stream) = v {
-                // TODO: remove
+                // TODO: drop stream
                 //finished_stream.remove()
                 debug!("Stream finished");
                 broken_streams += 1;
