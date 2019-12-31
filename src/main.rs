@@ -339,11 +339,14 @@ async fn message(
     ids_to_writer_entries: &mut HashMap<String, WriterEntry>,
     names_to_ids: &mut HashMap<String, String>,
 ) -> Result<()> {
+    let sender_name = match ids_to_writer_entries.get(&id) {
+        Some((name, _)) => name.clone(),
+        None => "unknown".to_string(),
+    };
     for receiver_name in to_names {
         let mut sent_to_channel: bool = false;
         if let Some(receiver_id) = names_to_ids.get(receiver_name.as_str()) {
-            if let Some((sender_name, receiver_channel)) =
-                ids_to_writer_entries.get_mut(receiver_id.as_str())
+            if let Some((_, receiver_channel)) = ids_to_writer_entries.get_mut(receiver_id.as_str())
             {
                 let msg = format!("Got message from '{}': {}", sender_name, msg);
                 sent_to_channel = match receiver_channel.send(msg).await {
@@ -416,7 +419,9 @@ async fn writer_loop(mut messages: Receiver<String>, stream: Arc<TcpStream>) -> 
 async fn main() -> Result<()> {
     init_logging().expect("Cannot init logging");
     let (_shutdown_sender, shutdown_receiver) = mpsc::unbounded();
-    let fut = accept_loop("127.0.0.1:8080", shutdown_receiver);
+    let addr = "127.0.0.1:8080";
+    info!("Starting tcp listener on {}", addr);
+    let fut = accept_loop(addr, shutdown_receiver);
     task::block_on(fut)
 }
 
